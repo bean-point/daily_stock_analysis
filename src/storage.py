@@ -936,6 +936,82 @@ class DatabaseManager:
                 session.commit()
                 logger.info(f"保存 {code} 数据成功，新增 {saved_count} 条")
                 
+            except IntegrityError as e:
+                # Handle race condition: record was inserted by another process between check and insert
+                session.rollback()
+                logger.warning(f"[{code}] Detected concurrent insertion conflict, switching to individual upsert mode...")
+
+                # Retry with individual upsert for each row
+                for _, row in df.iterrows():
+                    try:
+                        # Parse date
+                        row_date = row.get('date')
+                        if isinstance(row_date, str):
+                            row_date = datetime.strptime(row_date, '%Y-%m-%d').date()
+                        elif isinstance(row_date, datetime):
+                            row_date = row_date.date()
+                        elif isinstance(row_date, pd.Timestamp):
+                            row_date = row_date.date()
+
+                        # Try to get existing record again (with lock)
+                        existing = session.execute(
+                            select(StockDaily).where(
+                                and_(
+                                    StockDaily.code == code,
+                                    StockDaily.date == row_date
+                                )
+                            )
+                        ).scalar_one_or_none()
+
+                        if existing:
+                            # Update existing record
+                            existing.open = row.get('open')
+                            existing.high = row.get('high')
+                            existing.low = row.get('low')
+                            existing.close = row.get('close')
+                            existing.volume = row.get('volume')
+                            existing.amount = row.get('amount')
+                            existing.pct_chg = row.get('pct_chg')
+                            existing.ma5 = row.get('ma5')
+                            existing.ma10 = row.get('ma10')
+                            existing.ma20 = row.get('ma20')
+                            existing.volume_ratio = row.get('volume_ratio')
+                            existing.data_source = data_source
+                            existing.updated_at = datetime.now()
+                        else:
+                            # Insert new record
+                            record = StockDaily(
+                                code=code,
+                                date=row_date,
+                                open=row.get('open'),
+                                high=row.get('high'),
+                                low=row.get('low'),
+                                close=row.get('close'),
+                                volume=row.get('volume'),
+                                amount=row.get('amount'),
+                                pct_chg=row.get('pct_chg'),
+                                ma5=row.get('ma5'),
+                                ma10=row.get('ma10'),
+                                ma20=row.get('ma20'),
+                                volume_ratio=row.get('volume_ratio'),
+                                data_source=data_source,
+                            )
+                            session.add(record)
+                            saved_count += 1
+
+                        session.commit()
+                    except IntegrityError:
+                        # Skip this specific row if still conflicting
+                        session.rollback()
+                        logger.debug(f"[{code}] Skipping duplicate data: {row_date}")
+                        continue
+                    except Exception as row_error:
+                        session.rollback()
+                        logger.warning(f"[{code}] Failed to save individual record {row_date}: {row_error}")
+                        continue
+
+                logger.info(f"Saved {code} data successfully (concurrent handling mode), {saved_count} new records")
+
             except Exception as e:
                 session.rollback()
                 logger.error(f"保存 {code} 数据失败: {e}")
