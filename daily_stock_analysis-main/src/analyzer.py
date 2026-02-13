@@ -664,27 +664,40 @@ class GeminiAnalyzer:
 
     def _switch_to_fallback_model(self) -> bool:
         """
-        切换到备选模型
+        切换到备选模型（优先切换到 OpenAI，如果没有配置则使用 Gemini 备选模型）
 
         Returns:
             是否成功切换
         """
+        config = get_config()
+        
+        # 如果配置了 OpenAI，直接切换到 OpenAI
+        if config.openai_api_key:
+            logger.warning("[LLM] Gemini 主模型失败，直接切换到 OpenAI 兼容 API")
+            try:
+                self._init_openai_fallback()
+                if self._openai_client:
+                    logger.info("[LLM] 已切换到 OpenAI 兼容 API")
+                    return True
+            except Exception as e:
+                logger.error(f"[LLM] 切换到 OpenAI 失败: {e}")
+        
+        # 如果没有 OpenAI，使用 Gemini 备选模型
         try:
             import google.generativeai as genai
-            config = get_config()
             fallback_model = config.gemini_model_fallback
 
-            logger.warning(f"[LLM] 切换到备选模型: {fallback_model}")
+            logger.warning(f"[LLM] 切换到 Gemini 备选模型: {fallback_model}")
             self._model = genai.GenerativeModel(
                 model_name=fallback_model,
                 system_instruction=self.SYSTEM_PROMPT,
             )
             self._current_model_name = fallback_model
             self._using_fallback = True
-            logger.info(f"[LLM] 备选模型 {fallback_model} 初始化成功")
+            logger.info(f"[LLM] Gemini 备选模型 {fallback_model} 初始化成功")
             return True
         except Exception as e:
-            logger.error(f"[LLM] 切换备选模型失败: {e}")
+            logger.error(f"[LLM] 切换 Gemini 备选模型失败: {e}")
             return False
 
     def is_available(self) -> bool:
