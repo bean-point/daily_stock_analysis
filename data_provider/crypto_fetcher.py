@@ -19,10 +19,12 @@ CryptoFetcher - 加密货币数据源
 import logging
 import requests
 import pandas as pd
-from datetime import datetime
+import numpy as np
+from datetime import datetime, timedelta
 from typing import Optional
 
 from .base import BaseFetcher, DataFetchError, STANDARD_COLUMNS
+from .realtime_types import ChipDistribution
 
 logger = logging.getLogger(__name__)
 
@@ -320,4 +322,320 @@ class CryptoFetcher(BaseFetcher):
             
         except Exception as e:
             logger.warning(f"[Crypto] 获取 {stock_code} 实时行情失败: {e}")
+            return None
+
+    def get_chip_distribution(self, stock_code: str) -> Optional[ChipDistribution]:
+        """
+        获取加密货币筹码分布数据（三级降级策略）
+
+        1. 优先使用 Coinglass API（爆仓热力图分布）
+        2. 降级使用 Binance 期货数据（持仓量/多空比）
+        3. 最后使用历史K线模拟（VWAP估算）
+
+        Args:
+            stock_code: 交易对代码，如 'BTCUSDT'
+
+        Returns:
+            ChipDistribution 对象，获取失败返回 None
+        """
+        if not self._is_crypto_code(stock_code):
+            return None
+
+        # 1. 尝试 Coinglass API
+        chip_data = self._get_chip_from_coinglass(stock_code)
+        if chip_data:
+            return chip_data
+
+        # 2. 尝试 Binance 期货数据
+        chip_data = self._get_chip_from_binance_futures(stock_code)
+        if chip_data:
+            return chip_data
+
+        # 3. 最后使用历史K线模拟
+        chip_data = self._get_chip_from_historical(stock_code)
+        if chip_data:
+            return chip_data
+
+        return None
+
+    def _get_chip_from_coinglass(self, stock_code: str) -> Optional[ChipDistribution]:
+        """
+        从 Coinglass 获取爆仓热力图数据作为筹码分布
+        Coinglass API: https://coinglass.github.io/API-Reference/#liquidation-heatmap
+        """
+        try:
+            # 从环境变量获取 API Key
+            import os
+            api_key = os.getenv('COINGLASS_API_KEY')
+            if not api_key:
+                logger.debug("[Crypto筹码] Coinglass API Key 未配置，跳过")
+                return None
+
+            symbol = self._convert_symbol(stock_code)
+
+            # Coinglass Liquidation Heatmap API
+            url = "https://open-api.coinglass.com/public/v2/liquidation-heatmap"
+            headers = {
+                'coinglassSecret': api_key,
+                'accept': 'application/json'
+            }
+            params = {
+                'symbol': symbol,
+                'interval': '1d',  # 日线
+                'range': '30d'     # 最近30天
+            }
+
+            response = requests.get(url, headers=headers, params=params, timeout=15)
+
+            if response.status_code != 200:
+                logger.debug(f"[Crypto筹码] Coinglass API 返回 {response.status_code}")
+                return None
+
+            data = response.json()
+            if not data or 'data' not in data:
+                return None
+
+            # 解析爆仓热力图数据
+            heatmap_data = data['data']
+            if not heatmap_data:
+                return None
+
+            # 计算爆仓集中区（类似筹码集中区）
+            prices = []
+            volumes = []
+
+            for item in heatmap_data:
+                price = float(item.get('price', 0))
+                volume = float(item.get('liquidationVolume', 0))
+                if price > 0 and volume > 0:
+                    prices.append(price)
+                    volumes.append(volume)
+
+            if not prices:
+                return None
+
+            # 计算加权平均成本
+            avg_cost = sum(p * v for p, v in zip(prices, volumes)) / sum(volumes)
+
+            # 排序计算集中度
+            sorted_data = sorted(zip(prices, volumes), key=lambda x: x[0])
+            sorted_prices = [x[0] for x in sorted_data]
+            sorted_volumes = [x[1] for x in sorted_data]
+
+            cumsum_volumes = np.cumsum(sorted_volumes)
+            total_volume = cumsum_volumes[-1]
+            cumsum_ratios = cumsum_volumes / total_volume
+
+            # 90% 筹码区间
+            idx_5 = np.searchsorted(cumsum_ratios, 0.05)
+            idx_95 = np.searchsorted(cumsum_ratios, 0.95)
+            cost_90_low = sorted_prices[max(0, idx_5)]
+            cost_90_high = sorted_prices[min(len(sorted_prices) - 1, idx_95)]
+            concentration_90 = (cost_90_high - cost_90_low) / avg_cost if avg_cost > 0 else 0
+
+            # 70% 筹码区间
+            idx_15 = np.searchsorted(cumsum_ratios, 0.15)
+            idx_85 = np.searchsorted(cumsum_ratios, 0.85)
+            cost_70_low = sorted_prices[max(0, idx_15)]
+            cost_70_high = sorted_prices[min(len(sorted_prices) - 1, idx_85)]
+            concentration_70 = (cost_70_high - cost_70_low) / avg_cost if avg_cost > 0 else 0
+
+            # 估算获利比例（当前价格 vs 平均成本）
+            current_price = sorted_prices[-1] if sorted_prices else avg_cost
+            profit_ratio = 0.6 if current_price > avg_cost else 0.4
+
+            chip_data = ChipDistribution(
+                code=stock_code,
+                date=datetime.now().strftime('%Y-%m-%d'),
+                source='coinglass_liquidation',
+                profit_ratio=round(profit_ratio, 4),
+                avg_cost=round(avg_cost, 2),
+                cost_90_low=round(cost_90_low, 2),
+                cost_90_high=round(cost_90_high, 2),
+                concentration_90=round(concentration_90, 4),
+                cost_70_low=round(cost_70_low, 2),
+                cost_70_high=round(cost_70_high, 2),
+                concentration_70=round(concentration_70, 4),
+            )
+
+            logger.info(f"[Crypto筹码-Coinglass] {stock_code}: 获利比例={profit_ratio:.1%}, "
+                       f"平均成本={avg_cost:.2f}, 90%集中度={concentration_90:.2%}")
+
+            return chip_data
+
+        except Exception as e:
+            logger.debug(f"[Crypto筹码] Coinglass 获取失败: {e}")
+            return None
+
+    def _get_chip_from_binance_futures(self, stock_code: str) -> Optional[ChipDistribution]:
+        """
+        从 Binance 期货数据获取持仓信息作为筹码分布代理
+        使用多空比和持仓量来估算市场情绪
+        """
+        try:
+            symbol = self._convert_symbol(stock_code)
+
+            # 获取多空比
+            long_short_url = "https://fapi.binance.com/futures/data/globalLongShortAccountRatio"
+            params = {
+                'symbol': symbol,
+                'period': '1d',
+                'limit': 30
+            }
+
+            response = requests.get(long_short_url, params=params, timeout=10)
+            if response.status_code != 200:
+                return None
+
+            ls_data = response.json()
+            if not ls_data:
+                return None
+
+            # 获取持仓量
+            open_interest_url = "https://fapi.binance.com/fapi/v1/openInterest"
+            oi_response = requests.get(open_interest_url, params={'symbol': symbol}, timeout=10)
+
+            # 解析多空比数据
+            long_ratios = [float(d.get('longAccount', 0)) for d in ls_data if 'longAccount' in d]
+            short_ratios = [float(d.get('shortAccount', 0)) for d in ls_data if 'shortAccount' in d]
+
+            if not long_ratios:
+                return None
+
+            avg_long_ratio = sum(long_ratios) / len(long_ratios)
+            avg_short_ratio = sum(short_ratios) / len(short_ratios) if short_ratios else 0.5
+
+            # 获取当前价格
+            ticker_url = "https://api.binance.com/api/v3/ticker/24hr"
+            ticker_response = requests.get(ticker_url, params={'symbol': symbol}, timeout=10)
+
+            current_price = 0
+            if ticker_response.status_code == 200:
+                ticker_data = ticker_response.json()
+                current_price = float(ticker_data.get('lastPrice', 0))
+
+            if current_price == 0:
+                return None
+
+            # 基于多空比估算筹码分布
+            # 多头占优 -> 获利比例高（看涨情绪）
+            profit_ratio = avg_long_ratio
+
+            # 使用近期高低点作为筹码区间（简化估算）
+            prices = [float(d.get('longShortRatio', 1)) * current_price for d in ls_data[:10]]
+            if not prices:
+                prices = [current_price * 0.9, current_price * 1.1]
+
+            avg_cost = current_price * (1 + (avg_short_ratio - 0.5) * 0.1)  # 空头多则成本低
+
+            # 集中度基于多空比的波动
+            price_range = max(prices) - min(prices) if len(prices) > 1 else current_price * 0.05
+            concentration_90 = price_range / avg_cost if avg_cost > 0 else 0.1
+            concentration_70 = concentration_90 * 0.6
+
+            cost_90_low = avg_cost * (1 - concentration_90 / 2)
+            cost_90_high = avg_cost * (1 + concentration_90 / 2)
+            cost_70_low = avg_cost * (1 - concentration_70 / 2)
+            cost_70_high = avg_cost * (1 + concentration_70 / 2)
+
+            chip_data = ChipDistribution(
+                code=stock_code,
+                date=datetime.now().strftime('%Y-%m-%d'),
+                source='binance_futures',
+                profit_ratio=round(profit_ratio, 4),
+                avg_cost=round(avg_cost, 2),
+                cost_90_low=round(cost_90_low, 2),
+                cost_90_high=round(cost_90_high, 2),
+                concentration_90=round(concentration_90, 4),
+                cost_70_low=round(cost_70_low, 2),
+                cost_70_high=round(cost_70_high, 2),
+                concentration_70=round(concentration_70, 4),
+            )
+
+            logger.info(f"[Crypto筹码-Binance期货] {stock_code}: 多空比={avg_long_ratio:.1%}, "
+                       f"获利比例={profit_ratio:.1%}, 集中度={concentration_90:.2%}")
+
+            return chip_data
+
+        except Exception as e:
+            logger.debug(f"[Crypto筹码] Binance 期货获取失败: {e}")
+            return None
+
+    def _get_chip_from_historical(self, stock_code: str) -> Optional[ChipDistribution]:
+        """
+        使用历史K线数据模拟筹码分布（保底方案）
+        使用 VWAP（成交量加权平均价格）作为平均成本
+        """
+        try:
+            # 获取最近30天数据
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=30)
+
+            df = self._fetch_raw_data(
+                stock_code,
+                start_date.strftime('%Y-%m-%d'),
+                end_date.strftime('%Y-%m-%d')
+            )
+
+            if df is None or len(df) < 5:
+                logger.warning(f"[Crypto筹码] {stock_code} 历史数据不足")
+                return None
+
+            # 标准化数据
+            df = self._normalize_data(df, stock_code)
+
+            # 当前价格和 VWAP
+            current_price = df['close'].iloc[-1]
+            vwap = (df['close'] * df['volume']).sum() / df['volume'].sum()
+
+            # 获利比例
+            profit_ratio = 0.6 if current_price > vwap else 0.4
+            price_deviation = abs(current_price - vwap) / vwap
+            profit_ratio = min(0.95, max(0.05, profit_ratio + price_deviation * 0.3))
+
+            # 计算集中度
+            prices = df['close'].values
+            volumes = df['volume'].values
+
+            sorted_indices = np.argsort(prices)
+            sorted_prices = prices[sorted_indices]
+            sorted_volumes = volumes[sorted_indices]
+
+            cumsum_volumes = np.cumsum(sorted_volumes)
+            total_volume = cumsum_volumes[-1]
+            cumsum_ratios = cumsum_volumes / total_volume
+
+            idx_5 = np.searchsorted(cumsum_ratios, 0.05)
+            idx_95 = np.searchsorted(cumsum_ratios, 0.95)
+            cost_90_low = float(sorted_prices[max(0, idx_5)])
+            cost_90_high = float(sorted_prices[min(len(sorted_prices) - 1, idx_95)])
+            concentration_90 = (cost_90_high - cost_90_low) / vwap if vwap > 0 else 0
+
+            idx_15 = np.searchsorted(cumsum_ratios, 0.15)
+            idx_85 = np.searchsorted(cumsum_ratios, 0.85)
+            cost_70_low = float(sorted_prices[max(0, idx_15)])
+            cost_70_high = float(sorted_prices[min(len(sorted_prices) - 1, idx_85)])
+            concentration_70 = (cost_70_high - cost_70_low) / vwap if vwap > 0 else 0
+
+            chip_data = ChipDistribution(
+                code=stock_code,
+                date=df['date'].iloc[-1],
+                source='crypto_vwap',
+                profit_ratio=round(profit_ratio, 4),
+                avg_cost=round(vwap, 2),
+                cost_90_low=round(cost_90_low, 2),
+                cost_90_high=round(cost_90_high, 2),
+                concentration_90=round(concentration_90, 4),
+                cost_70_low=round(cost_70_low, 2),
+                cost_70_high=round(cost_70_high, 2),
+                concentration_70=round(concentration_70, 4),
+            )
+
+            logger.info(f"[Crypto筹码-VWAP] {stock_code}: 获利比例={profit_ratio:.1%}, "
+                       f"VWAP={vwap:.2f}, 90%集中度={concentration_90:.2%}")
+
+            return chip_data
+
+        except Exception as e:
+            logger.warning(f"[Crypto筹码] 历史K线模拟失败: {e}")
             return None
